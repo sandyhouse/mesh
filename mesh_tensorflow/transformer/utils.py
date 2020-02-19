@@ -244,6 +244,7 @@ def variable_filter_max_size(v, max_size=1e7):
 @gin.configurable
 def tpu_estimator_model_fn(model_type,
                            transformer_model,
+                           vocabulary,
                            model_dir,
                            use_tpu,
                            mesh_shape,
@@ -269,6 +270,8 @@ def tpu_estimator_model_fn(model_type,
     model_type: a string. One of "bitransformer", "lm", "aligned", or
       "bi_teacher_student"
     transformer_model: a transformer.Unitransformer or transformer.Bitransformer
+    vocabulary: a vocabulary.Vocabulary or (inputs_vocabulary,
+      targets_vocabulary) tuple. Used for decoding in predict mode.
     model_dir: a string, directory to save the model to.
     use_tpu: a boolean
     mesh_shape: a mtf.Shape
@@ -289,7 +292,7 @@ def tpu_estimator_model_fn(model_type,
       models
     tpu_summaries: a boolean, use rewrites to make summaries work on TPU.  This
       may be slow, since it uses a host call hack.
-    predict_fn: an optional function, see docs for `run` for more information
+    predict_fn: an optional function, see docs for `run` for more information.
     variable_filter: controls which variables are trained.
       If None (default), train all trainable variables.
       If a string regex, train all variables that match this regex.
@@ -416,9 +419,12 @@ def tpu_estimator_model_fn(model_type,
       lowering = mtf.Lowering(graph, {mesh: mesh_impl}, autostack=autostack)
       inputs = lowering.export_to_tf_tensor(inputs)
       outputs = lowering.export_to_tf_tensor(mtf_samples)
+      with tf.device("cpu"):
+        inputs_str = clean_decodes(inputs, inputs_vocabulary(vocabulary))
+        outputs_str = clean_decodes(outputs, targets_vocabulary(vocabulary))
       predictions = {
-          "inputs": inputs,
-          "outputs": outputs}
+          "inputs": inputs_str,
+          "outputs": outputs_str}
 
       # When exporting a model, we need to communicate to TF-Serving that
       # master variables need to be copied to their slave slice variables.
@@ -825,14 +831,12 @@ def encode_inputs(inputs,
 @gin.configurable
 def decode(estimator,
            input_fn,
-           vocabulary,
            checkpoint_path=None):
   """Decode from an input_fn.
 
   Args:
     estimator: a TPUEstimator
     input_fn: function that returns a tf.Dataset
-    vocabulary: a mtf.transformer.vocabulary.Vocabulary
     checkpoint_path: an optional string
 
   Returns:
@@ -840,20 +844,13 @@ def decode(estimator,
   """
   result_iter = estimator.predict(input_fn,
                                   checkpoint_path=checkpoint_path)
-  vocab_size = targets_vocabulary(vocabulary).vocab_size
   decodes = []
   for i, result in enumerate(result_iter):
-    output_ids = clean_decodes(list(result["outputs"]), vocab_size)
-    output_string = targets_vocabulary(vocabulary).decode(
-        [int(x) for x in output_ids])
-    decodes.append(output_string)
-    input_ids = clean_decodes(list(result["inputs"]), vocab_size)
-    input_string = targets_vocabulary(vocabulary).decode(
-        [int(x) for x in input_ids])
+    decodes.append(result["outputs"])
     if i & (i - 1) == 0:
       # LOG every power of 2.
-      tf.logging.info("decoded {}: {}".format(i, input_string))
-      tf.logging.info("            -> {}".format(output_string))
+      tf.logging.info("decoded {}: {}".format(i, result["inputs"]))
+      tf.logging.info("            -> {}".format(result["outputs"]))
   return decodes
 
 
@@ -934,9 +931,7 @@ def decode_from_file(estimator,
     return dataset
 
   checkpoint_step = get_step_from_checkpoint_path(checkpoint_path)
-  decodes = decode(
-      estimator, input_fn, vocabulary, checkpoint_path=checkpoint_path
-  )
+  decodes = decode(estimator, input_fn, checkpoint_path=checkpoint_path)
   # Remove any padded examples
   dataset_size = len(inputs) * repeats
   decodes = decodes[:dataset_size]
@@ -945,28 +940,26 @@ def decode_from_file(estimator,
 
 
 @gin.configurable
-def clean_decodes(ids, vocab_size, eos_id=1):
-  """Stop at EOS or padding or OOV.
+def clean_decodes(ids, vocabulary, eos_id=1, pad_id=0):
+  """Detokenize ids, stopping at EOS.
 
   Args:
-    ids: a list of integers
-    vocab_size: an integer
-    eos_id: EOS id
+    ids: a Tensor of type int.
+    vocabulary: a mtf.transformer.vocabulary.Vocabulary to use for
+      detokenization.
+    eos_id: int, EOS id.
+    pad_id: int, PAD id.
 
   Returns:
-    a list of integers
+    a Tensor of detokenized strings.
   """
-  ret = []
-  for i in ids:
-    if i == eos_id:
-      break
-    if i >= vocab_size:
-      break
-    ret.append(int(i))
-  return ret
+  # Replace anything after EOS with PAD.
+  eos_and_after = tf.cumsum(tf.cast(tf.equal(ids, eos_id), tf.int32), axis=1)
+  ids = tf.where_v2(tf.equal(eos_and_after, 0), ids, pad_id)
+  return vocabulary.decode_tf(ids)
 
 
-def get_estimator(model_type, input_vocab_size, output_vocab_size, mesh_shape,
+def get_estimator(model_type, vocabulary, mesh_shape,
                   layout_rules, model_dir, batch_size, sequence_length,
                   autostack, learning_rate_schedule, keep_checkpoint_max,
                   save_checkpoints_steps, optimizer, predict_fn,
@@ -978,8 +971,8 @@ def get_estimator(model_type, input_vocab_size, output_vocab_size, mesh_shape,
   Args:
     model_type: a string - either "bitransformer", "bi_student_teacher", lm" or
       "aligned"
-    input_vocab_size: an integer, size of the input vocabulary.
-    output_vocab_size: an integer, size of the output vocabulary.
+    vocabulary: a vocabulary.Vocabulary or (inputs_vocabulary,
+      targets_vocabulary) tuple
     mesh_shape: a function passed in through gin that returns a mtf.Shape
     layout_rules: an input to mtf.convert_to_layout_rules()
     model_dir: a string, model directory path.
@@ -1033,14 +1026,15 @@ def get_estimator(model_type, input_vocab_size, output_vocab_size, mesh_shape,
 
   transformer_model = build_model(
       model_type=model_type,
-      input_vocab_size=input_vocab_size,
-      output_vocab_size=output_vocab_size,
+      input_vocab_size=inputs_vocabulary(vocabulary).vocab_size,
+      output_vocab_size=targets_vocabulary(vocabulary).vocab_size,
       layout_rules=layout_rules,
       mesh_shape=mesh_shape)
 
   model_fn = tpu_estimator_model_fn(
       model_type=model_type,
       transformer_model=transformer_model,
+      vocabulary=vocabulary,
       model_dir=model_dir,
       use_tpu=use_tpu,
       mesh_shape=mesh_shape,
@@ -1278,7 +1272,7 @@ def eval_model(estimator, vocabulary, sequence_length, batch_size,
   for checkpoint_path in checkpoint_paths:
     tf.logging.info("Checkpoint path %s" % checkpoint_path)
     global_step = int(get_step_from_checkpoint_path(checkpoint_path))
-    decodes = decode(estimator, input_fn, vocabulary, checkpoint_path)
+    decodes = decode(estimator, input_fn, checkpoint_path)
     for eval_dataset in eval_datasets:
       # Extract the portion of decodes corresponding to this dataset
       examples = cached_examples[eval_dataset.name]
@@ -1343,27 +1337,13 @@ def export_model(estimator, export_dir, vocabulary, sequence_length,
     Returns:
       a ServingInputReceiver
     """
-    serialized_example = tf.placeholder(
+    inputs = tf.placeholder(
         dtype=tf.string,
         shape=[None],
-        name="serialized_example")
+        name="inputs")
 
-    def parse_example(serialized_example):
-      """Function to parse serialized example with default features."""
-      # For text2text models, "inputs" provides conditioning text. ("targets"
-      # is only used for train and eval).
-      #
-      # For text2self models, "inputs" provide partial sequences that are used
-      # to generate outputs.
-      example_specs = {
-          "inputs": tfds.features.Text().get_serialized_info(),
-      }
-
-      parser = tfds.core.example_parser.ExampleParser(example_specs)
-      return parser.parse_example(serialized_example)
-
-    dataset = tf.data.Dataset.from_tensor_slices(serialized_example)
-    dataset = dataset.map(parse_example)
+    dataset = tf.data.Dataset.from_tensor_slices(inputs)
+    dataset = dataset.map(lambda x: {"inputs": x})
     dataset = transformer_dataset.encode_all_features(dataset, vocabulary)
     dataset = transformer_dataset.pack_or_pad(
         dataset=dataset,
@@ -1373,19 +1353,19 @@ def export_model(estimator, export_dir, vocabulary, sequence_length,
     )
 
     dataset = dataset.padded_batch(
-        tf.shape(serialized_example, out_type=tf.int64)[0],
-        dataset.output_shapes)
+        tf.shape(inputs, out_type=tf.int64)[0],
+        tf.data.get_output_shapes(dataset))
 
     features = tf.data.experimental.get_single_element(dataset)
 
     return tf.estimator.export.ServingInputReceiver(
-        features=features, receiver_tensors=serialized_example)
+        features=features, receiver_tensors=inputs)
 
   tpu_estimator.export_estimator_savedmodel(
       estimator=estimator,
       export_dir_base=export_dir,
       serving_input_receiver_fn=serving_input_fn,
-      as_text=True,
+      as_text=False,
       checkpoint_path=checkpoint_path,
   )
 
@@ -1706,8 +1686,7 @@ def run(tpu_job_name,
 
   estimator = get_estimator(
       model_type=model_type,
-      input_vocab_size=inputs_vocabulary(vocabulary).vocab_size,
-      output_vocab_size=targets_vocabulary(vocabulary).vocab_size,
+      vocabulary=vocabulary,
       layout_rules=layout_rules,
       mesh_shape=mesh_shape,
       model_dir=model_dir,
